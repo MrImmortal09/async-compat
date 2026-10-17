@@ -5,10 +5,11 @@
 //! 1. Tokio's types cannot be used outside tokio context, so any attempt to use them will panic.
 //!     - Solution: If you apply the [`Compat`] adapter to a future, the future will manually
 //!       enter the context of a global tokio runtime. If a runtime is already available via tokio
-//!       thread-locals, then it will be used. Otherwise, a new single-threaded runtime will be
-//!       created on demand. That does *not* mean the future is polled by the tokio runtime - it
-//!       only means the future sets a thread-local variable pointing to the global tokio runtime so
-//!       that tokio's types can be used inside it.
+//!       thread-locals, then it will be used. Otherwise, a fallback runtime is used, which by
+//!       default is a single-threaded runtime created on demand (see below to change it). That
+//!       does *not* mean the future is polled by the tokio runtime - it only means the future sets
+//!       a thread-local variable pointing to the global tokio runtime so that tokio's types can be
+//!       used inside it.
 //! 2. Tokio and futures have similar but different I/O traits `AsyncRead`, `AsyncWrite`,
 //!    `AsyncBufRead`, and `AsyncSeek`.
 //!     - Solution: When the [`Compat`] adapter is applied to an I/O type, it will implement traits
@@ -36,6 +37,13 @@
 //! enabling it anywhere in a dependency graph enables it for every [`Compat`] user in that binary.
 //! Nothing that works without the feature stops working with it - a multi-threaded scheduler is
 //! strictly more permissive - but it is worth knowing that the choice is not local to one crate.
+//!
+//! # Supplying the fallback runtime
+//!
+//! To control the fallback runtime yourself - the number of worker threads, their names, or code
+//! that runs as each one starts - build a runtime and pass it to [`set_fallback_runtime()`]
+//! before anything falls back to it. It is then used instead of the default, whether or not the
+//! `multi-thread` feature is enabled.
 //!
 //! # Examples
 //!
@@ -149,12 +157,11 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
-#[cfg(not(feature = "multi-thread"))]
 use std::thread;
 
 use futures_core::ready;
-use once_cell::sync::Lazy;
 use pin_project_lite::pin_project;
 
 /// Applies the [`Compat`] adapter to futures and I/O types.
@@ -473,41 +480,90 @@ impl<T: futures_io::AsyncSeek> tokio::io::AsyncSeek for Compat<T> {
     }
 }
 
+/// Sets the runtime that [`Compat`] uses when it is polled outside a tokio context.
+///
+/// That fallback runtime is otherwise created the first time something needs it, with the
+/// scheduler chosen by the `multi-thread` feature. Call this before then to supply your own -
+/// for example to choose the number of worker threads, name them, or run code as each starts.
+///
+/// Build it with [`enable_all()`] so that tokio's timers and I/O work inside [`Compat`]. A
+/// [`Handle`] cloned from it before the call stays valid, because the fallback runtime is never
+/// shut down.
+///
+/// # Errors
+///
+/// Hands the runtime back if a fallback runtime has already been set or created, since a
+/// [`Compat`] may already be using it.
+///
+/// # Examples
+///
+/// ```
+/// let rt = tokio::runtime::Builder::new_multi_thread()
+///     .worker_threads(2)
+///     .thread_name("my-app-tokio")
+///     .enable_all()
+///     .build()
+///     .unwrap();
+///
+/// async_compat::set_fallback_runtime(rt).expect("fallback runtime already set");
+/// ```
+///
+/// [`enable_all()`]: tokio::runtime::Builder::enable_all
+/// [`Handle`]: tokio::runtime::Handle
+pub fn set_fallback_runtime(rt: tokio::runtime::Runtime) -> Result<(), tokio::runtime::Runtime> {
+    let current_thread =
+        rt.handle().runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread;
+    TOKIO1.set(rt)?;
+    if current_thread {
+        drive_fallback_runtime();
+    }
+    Ok(())
+}
+
 fn get_runtime_handle() -> tokio::runtime::Handle {
-    tokio::runtime::Handle::try_current().unwrap_or_else(|_| TOKIO1.handle().clone())
+    tokio::runtime::Handle::try_current().unwrap_or_else(|_| fallback_runtime().handle().clone())
+}
+
+static TOKIO1: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn fallback_runtime() -> &'static tokio::runtime::Runtime {
+    TOKIO1.get_or_init(default_fallback_runtime)
 }
 
 /// A current-thread scheduler parks unless something drives it, so a dedicated
 /// thread holds it open on a future that never completes. Tasks spawned into it
 /// therefore run on that one thread.
-#[cfg(not(feature = "multi-thread"))]
-static TOKIO1: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+fn drive_fallback_runtime() {
     thread::Builder::new()
         .name("async-compat/tokio-1".into())
-        .spawn(|| TOKIO1.block_on(Pending))
+        .spawn(|| fallback_runtime().block_on(Pending))
         .unwrap();
-    tokio::runtime::Builder::new_current_thread()
+}
+
+#[cfg(not(feature = "multi-thread"))]
+fn default_fallback_runtime() -> tokio::runtime::Runtime {
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("cannot start tokio-1 runtime")
-});
+        .expect("cannot start tokio-1 runtime");
+    drive_fallback_runtime();
+    rt
+}
 
 /// A multi-threaded scheduler drives its own workers, reactor and timer, so it
 /// needs no thread to hold it open. Spawned tasks run on real worker threads,
 /// which is what makes [`tokio::task::block_in_place`] usable inside them.
 #[cfg(feature = "multi-thread")]
-static TOKIO1: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+fn default_fallback_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("async-compat/tokio-1")
         .build()
         .expect("cannot start tokio-1 runtime")
-});
+}
 
-#[cfg(not(feature = "multi-thread"))]
 struct Pending;
 
-#[cfg(not(feature = "multi-thread"))]
 impl Future for Pending {
     type Output = ();
 
@@ -518,7 +574,6 @@ impl Future for Pending {
 
 #[cfg(test)]
 mod tests {
-    use super::Lazy;
     use crate::{CompatExt, TOKIO1};
 
     #[test]
@@ -532,14 +587,14 @@ mod tests {
 
         // We didn't need to create the fallback runtime, because we used compat
         // inside of an existing tokio context.
-        assert!(Lazy::get(&TOKIO1).is_none());
+        assert!(TOKIO1.get().is_none());
 
         // Use compat outside of a tokio context.
         futures::executor::block_on(use_tokio().compat());
 
         // We must have created the fallback runtime, because we used compat
         // outside of a tokio context.
-        assert!(Lazy::get(&TOKIO1).is_some());
+        assert!(TOKIO1.get().is_some());
     }
 
     async fn use_tokio() {
